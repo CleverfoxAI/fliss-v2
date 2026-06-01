@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
+import logging
+import re
 from typing import Optional, List, Any
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from chat.engine import ConversationEngine
 from chat.persistence import save_conversation
 from tools.search import close_pool
@@ -33,14 +35,14 @@ app.add_middleware(
 # ── Frontend-compatible API contract ─────────────────────────────────────────
 
 class QueryContext(BaseModel):
-    session_id: str
+    session_id: str = "default"
 
 
 class QueryRequest(BaseModel):
     query: str
     mode: str = "text"
-    context: QueryContext
-    type: str = "CAREHOME"  # CAREHOME | NURSERY | HOMECARE
+    context: QueryContext = Field(default_factory=QueryContext)
+    type: str = "CAREHOME"  # DEFAULT | CAREHOME | NURSERY | HOMECARE | JOBS
 
 
 class QueryResponse(BaseModel):
@@ -56,60 +58,166 @@ class QueryResponse(BaseModel):
 # In-memory conversation history per session
 _sessions: dict = {}
 
+VALID_PAGE_TYPES = {"CAREHOME", "NURSERY", "HOMECARE", "JOBS"}
+
+CARE_TYPE_LABELS = {
+    "CAREHOME": "care homes",
+    "HOMECARE": "home care",
+    "NURSERY": "day nurseries",
+    "JOBS": "care jobs",
+}
+
+FIRST_STEP_REPLY = (
+    "Of course. Are you looking for a care home, home care, or a day nursery?"
+)
+
+BACKEND_FALLBACK_REPLY = (
+    "I'm here, but I'm having trouble reaching live results right now. "
+    "Are you looking for a care home, home care, or a day nursery?"
+)
+
+
+def _normalise_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _infer_page_type(query: str) -> Optional[str]:
+    text = _normalise_text(query)
+    if any(term in text for term in ["nursery", "nurseries", "childcare", "child care"]):
+        return "NURSERY"
+    if any(term in text for term in ["home care", "homecare", "care at home", "domiciliary"]):
+        return "HOMECARE"
+    if any(term in text for term in ["care home", "carehome", "residential", "nursing home"]):
+        return "CAREHOME"
+    if any(term in text for term in ["job", "jobs", "career", "vacancy", "work in care"]):
+        return "JOBS"
+    return None
+
+
+def _normalise_page_type(raw_type: str, query_text: str) -> str:
+    page_type = (raw_type or "").upper()
+    if page_type in VALID_PAGE_TYPES:
+        return page_type
+    return _infer_page_type(query_text) or "CAREHOME"
+
+
+def _is_greeting_or_first_step(query: str) -> bool:
+    text = _normalise_text(query)
+    if not text:
+        return True
+    return text in {
+        "hi", "hello", "hey", "hiya", "help", "start", "get started",
+        "i need help", "can you help", "can you help me",
+    }
+
+
+def _is_care_type_only(query: str) -> bool:
+    text = _normalise_text(query)
+    care_type = _infer_page_type(text)
+    if not care_type or care_type == "JOBS":
+        return False
+    filler_removed = re.sub(
+        r"\b(i|we|need|want|am|i'm|looking|for|a|an|the|find|please|me|some)\b",
+        " ",
+        text,
+    )
+    filler_removed = _normalise_text(filler_removed)
+    return filler_removed in {
+        "care home", "care homes", "carehome", "home care", "homecare",
+        "day nursery", "nursery", "nurseries", "childcare", "child care",
+    }
+
+
+def _first_step_response(query_text: str, page_type: str) -> Optional[QueryResponse]:
+    if _is_greeting_or_first_step(query_text):
+        return QueryResponse(
+            intent="clarify",
+            confidence=1.0,
+            answer=FIRST_STEP_REPLY,
+            results=[],
+        )
+
+    if _is_care_type_only(query_text):
+        label = CARE_TYPE_LABELS.get(page_type, "care")
+        return QueryResponse(
+            intent="clarify",
+            confidence=1.0,
+            answer=f"Great - I can help with {label}. Where should I search?",
+            results=[],
+        )
+
+    return None
+
+
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
-    session_id = req.context.session_id
-    page_type = req.type
+    session_id = req.context.session_id or "default"
+    page_type = _normalise_page_type(req.type, req.query)
 
-    # Get or create conversation history for this session
-    session_key = f"{session_id}:{page_type}"
-    if session_key not in _sessions:
-        _sessions[session_key] = []
-    history = _sessions[session_key]
+    local_response = _first_step_response(req.query, page_type)
+    if local_response:
+        return local_response
 
-    engine = ConversationEngine(frontend_type=page_type)
-    result = await engine.chat(
-        message=req.query,
-        conversation_history=history,
-    )
+    try:
+        # Get or create conversation history for this session
+        session_key = f"{session_id}:{page_type}"
+        if session_key not in _sessions:
+            _sessions[session_key] = []
+        history = _sessions[session_key]
 
-    # Append to conversation history for next turn
-    history.append({"role": "user", "content": req.query})
-    # Store the answer as-is — no metadata in the content
-    stored_content = result["answer"]
-    filters_used = result.get("filters_used")
-    assistant_msg = {"role": "assistant", "content": stored_content}
-    # Store search metadata separately so engine.py can inject it
-    # as context without it leaking into the AI's visible response text
-    if filters_used:
-        assistant_msg["filters_used"] = filters_used
-    if result.get("results"):
-        assistant_msg["results"] = result["results"]
-        assistant_msg["title"] = result.get("title", "")
-        assistant_msg["center_lat"] = result.get("center_lat")
-        assistant_msg["center_lng"] = result.get("center_lng")
-    # Persist deferred results across the wellbeing check-in turn
-    if result.get("pending_results"):
-        assistant_msg["pending_results"] = result["pending_results"]
-    history.append(assistant_msg)
+        engine = ConversationEngine(frontend_type=page_type)
+        result = await engine.chat(
+            message=req.query,
+            conversation_history=history,
+        )
 
-    # Fire-and-forget persistence of the full conversation for analysis.
-    location = None
-    for m in reversed(history):
-        f = m.get("filters_used") if isinstance(m, dict) else None
-        if f and f.get("location"):
-            location = f["location"]
-            break
-    save_conversation(
-        session_id=session_id,
-        user_type=page_type,
-        location=location,
-        messages=history,
-    )
+        # Append to conversation history for next turn
+        history.append({"role": "user", "content": req.query})
+        # Store the answer as-is — no metadata in the content
+        stored_content = result["answer"]
+        filters_used = result.get("filters_used")
+        assistant_msg = {"role": "assistant", "content": stored_content}
+        # Store search metadata separately so engine.py can inject it
+        # as context without it leaking into the AI's visible response text
+        if filters_used:
+            assistant_msg["filters_used"] = filters_used
+        if result.get("results"):
+            assistant_msg["results"] = result["results"]
+            assistant_msg["title"] = result.get("title", "")
+            assistant_msg["center_lat"] = result.get("center_lat")
+            assistant_msg["center_lng"] = result.get("center_lng")
+        # Persist deferred results across the wellbeing check-in turn
+        if result.get("pending_results"):
+            assistant_msg["pending_results"] = result["pending_results"]
+        history.append(assistant_msg)
 
-    return QueryResponse(**result)
+        # Fire-and-forget persistence of the full conversation for analysis.
+        location = None
+        for m in reversed(history):
+            f = m.get("filters_used") if isinstance(m, dict) else None
+            if f and f.get("location"):
+                location = f["location"]
+                break
+        try:
+            save_conversation(
+                session_id=session_id,
+                user_type=page_type,
+                location=location,
+                messages=history,
+            )
+        except Exception:
+            logging.exception("Failed to save conversation")
 
+        return QueryResponse(**result)
+    except Exception:
+        logging.exception("Failed to process /api/query")
+        return QueryResponse(
+            intent="clarify",
+            confidence=0.0,
+            answer=BACKEND_FALLBACK_REPLY,
+            results=[],
+        )
 
 # ── History endpoint ─────────────────────────────────────────────────────────
 
