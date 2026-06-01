@@ -164,15 +164,6 @@ async def query(req: QueryRequest):
     session_id = req.context.session_id or "default"
     page_type = _normalise_page_type(req.type, req.query)
 
-    local_response = _first_step_response(req.query, page_type)
-    if local_response:
-        session_key = f"{session_id}:{page_type}"
-        if session_key not in _sessions:
-            _sessions[session_key] = []
-        _sessions[session_key].append({"role": "user", "content": req.query})
-        _sessions[session_key].append({"role": "assistant", "content": local_response.answer})
-        return local_response
-
     try:
         # Get or create conversation history for this session
         session_key = f"{session_id}:{page_type}"
