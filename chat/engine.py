@@ -382,10 +382,15 @@ class ConversationEngine:
         # Safety net: Anthropic retired the dated Sonnet 4 / Opus 4 snapshots on
         # 15 Jun 2026, so requesting them now 404s. If a stale snapshot string is
         # still configured (e.g. via the FLISS_MODEL env var on Railway), remap it
-        # to its official migration target so requests don't fail. The env var
-        # should still be updated to the new value; this is a defensive fallback.
+        # to an active model so requests don't fail. The env var should still be
+        # updated to the new value; this is a defensive fallback.
+        #
+        # Sonnet 4 -> Sonnet 4.5 (not 4.6): 4.5 is the closest active model to the
+        # retired Sonnet 4 and preserves its tool-calling behaviour. The 4.6 family
+        # under-triggers tools, which made Fliss narrate "here are the listings"
+        # without calling search_listings, so no result cards rendered.
         _retired_model_migrations = {
-            "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+            "claude-sonnet-4-20250514": "claude-sonnet-4-5",
             "claude-opus-4-20250514": "claude-opus-4-8",
         }
         self.model = _retired_model_migrations.get(self.model, self.model)
