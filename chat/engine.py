@@ -379,6 +379,16 @@ class ConversationEngine:
         settings = get_settings()
         self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.model = settings.fliss_model
+        # Safety net: Anthropic retired the dated Sonnet 4 / Opus 4 snapshots on
+        # 15 Jun 2026, so requesting them now 404s. If a stale snapshot string is
+        # still configured (e.g. via the FLISS_MODEL env var on Railway), remap it
+        # to its official migration target so requests don't fail. The env var
+        # should still be updated to the new value; this is a defensive fallback.
+        _retired_model_migrations = {
+            "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+            "claude-opus-4-20250514": "claude-opus-4-8",
+        }
+        self.model = _retired_model_migrations.get(self.model, self.model)
         if self.model in {"claude-3-haiku-20240307", "claude-haiku-4-5-20251001"}:
             self.model = "claude-3-5-haiku-20241022"
         self.frontend_type = frontend_type
