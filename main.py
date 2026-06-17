@@ -11,8 +11,35 @@ from chat.persistence import save_conversation
 from tools.search import close_pool
 
 
+def _check_model_config() -> None:
+    """Warn loudly at startup if the configured model is retired.
+
+    Offline check against config.RETIRED_MODELS — no network call, so it can
+    never itself delay or fail startup. Turns a silent in-production 404 into a
+    visible deploy-time log line.
+    """
+    try:
+        from config import get_settings, resolve_model, RETIRED_MODELS
+
+        raw = get_settings().fliss_model
+        effective = resolve_model(raw)
+        if effective in RETIRED_MODELS:
+            logging.critical(
+                "FLISS_MODEL=%r resolves to %r, which Anthropic has RETIRED — "
+                "requests will 404. Set FLISS_MODEL to an active model alias "
+                "(e.g. claude-sonnet-4-5).",
+                raw, effective,
+            )
+        else:
+            logging.info("Fliss model config OK: FLISS_MODEL=%r -> %r", raw, effective)
+    except Exception:
+        # Never let the model check break startup.
+        logging.exception("Model config check failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _check_model_config()
     yield
     await close_pool()
 

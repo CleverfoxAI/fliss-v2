@@ -1,8 +1,9 @@
 from __future__ import annotations
 import json
+import logging
 import re
 from anthropic import AsyncAnthropic
-from config import get_settings
+from config import get_settings, resolve_model
 from chat.prompts import get_system_prompt
 from tools.search import search_listings, search_jobs
 from tools.knowledge import search_knowledge_base
@@ -370,6 +371,26 @@ def _last_assistant_asked_wellbeing(messages: list[dict]) -> bool:
     return False
 
 
+# Phrases the model uses when it claims to be showing listings. Result cards
+# only render when search_listings actually returns data, so these phrases
+# appearing WITHOUT a search are the signature of the "narrated results but no
+# cards" failure. Used both to trigger auto-recovery and to alert on it.
+_RESULTS_TEXT_PHRASES = (
+    "take a look at the options",
+    "take a look at the listings",
+    "here are some",
+    "i've found some",
+    "i found some",
+    "check out the options",
+    "options below",
+)
+
+
+def _looks_like_results_text(answer: str) -> bool:
+    low = (answer or "").lower()
+    return any(phrase in low for phrase in _RESULTS_TEXT_PHRASES)
+
+
 class ConversationEngine:
     def __init__(self, frontend_type: str):
         """
@@ -378,24 +399,11 @@ class ConversationEngine:
         """
         settings = get_settings()
         self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.fliss_model
-        # Safety net: Anthropic retired the dated Sonnet 4 / Opus 4 snapshots on
-        # 15 Jun 2026, so requesting them now 404s. If a stale snapshot string is
-        # still configured (e.g. via the FLISS_MODEL env var on Railway), remap it
-        # to an active model so requests don't fail. The env var should still be
-        # updated to the new value; this is a defensive fallback.
-        #
-        # Sonnet 4 -> Sonnet 4.5 (not 4.6): 4.5 is the closest active model to the
-        # retired Sonnet 4 and preserves its tool-calling behaviour. The 4.6 family
-        # under-triggers tools, which made Fliss narrate "here are the listings"
-        # without calling search_listings, so no result cards rendered.
-        _retired_model_migrations = {
-            "claude-sonnet-4-20250514": "claude-sonnet-4-5",
-            "claude-opus-4-20250514": "claude-opus-4-8",
-        }
-        self.model = _retired_model_migrations.get(self.model, self.model)
-        if self.model in {"claude-3-haiku-20240307", "claude-haiku-4-5-20251001"}:
-            self.model = "claude-3-5-haiku-20241022"
+        # Resolve the configured model through the central remap (config.resolve_model)
+        # so a stale/retired FLISS_MODEL value can't take the service down. Keeping
+        # this in one place means the engine and the startup validity check (main.py)
+        # always agree on the effective model.
+        self.model = resolve_model(settings.fliss_model)
         self.frontend_type = frontend_type
         print(f"[DEBUG] frontend_type={self.frontend_type}")
         page_type = FRONTEND_TYPE_TO_PAGE.get(frontend_type, "care_homes")
@@ -632,20 +640,9 @@ class ConversationEngine:
                 # Auto-recovery: if AI wrote results-like text without calling
                 # the search tool, extract location and force a search so the
                 # frontend gets listing cards to display.
-                if not search_performed and any(
-                    phrase in answer.lower()
-                    for phrase in [
-                        "take a look at the options",
-                        "here are some",
-                        "i've found some",
-                        "i found some",
-                        "check out the options",
-                        "options below",
-                    ]
-                ):
+                if not search_performed and _looks_like_results_text(answer):
                     location = self._extract_location_from_history(messages)
                     if location:
-                        import logging
                         logging.warning(
                             f"[Fliss] AI wrote results text without calling search tool. "
                             f"Auto-recovering with location={location}, type={self.frontend_type}"
@@ -716,6 +713,18 @@ class ConversationEngine:
                             "filters_used": filters_used,
                         },
                     }
+
+                # Alert: the model claimed to show listings but no results were
+                # produced, so the frontend will render zero cards. This is the
+                # signature of a model that stopped calling search_listings (the
+                # Sonnet 4 -> 4.6 regression). Log loudly so it's caught fast.
+                if not listings_results and _looks_like_results_text(answer):
+                    logging.error(
+                        "[Fliss] Model narrated results but produced none — no cards "
+                        "will render. model=%s frontend_type=%s search_performed=%s "
+                        "answer_first120=%r",
+                        self.model, self.frontend_type, search_performed, answer[:120],
+                    )
 
                 print(f"[WB-DIAG] final_return answer_first200={answer[:200]!r} intent={intent}", flush=True)
                 return {
