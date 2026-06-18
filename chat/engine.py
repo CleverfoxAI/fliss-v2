@@ -588,6 +588,21 @@ class ConversationEngine:
                                     "content": result_json,
                                 })
                                 continue
+                            # GUARD: never call search without a location. The model
+                            # sometimes proceeds to results before a town/postcode is
+                            # given; _handle_search needs a location, so ask instead of
+                            # crashing into the generic error fallback.
+                            if not (block.input.get("location") or "").strip():
+                                result_json = json.dumps({
+                                    "error": "BLOCKED: No location provided. Ask the user for a town or postcode before searching, e.g. 'Which town or postcode should I search around?'",
+                                    "action": "ask_location",
+                                })
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": result_json,
+                                })
+                                continue
                             result_json, raw_results, geo = await self._handle_search(block.input)
                             search_performed = True
                             listings_results = raw_results
@@ -600,6 +615,17 @@ class ConversationEngine:
                                 center_lat = geo["latitude"]
                                 center_lng = geo["longitude"]
                         elif block.name == "search_jobs":
+                            if not (block.input.get("location") or "").strip():
+                                result_json = json.dumps({
+                                    "error": "BLOCKED: No location provided. Ask the user for a town or postcode before searching.",
+                                    "action": "ask_location",
+                                })
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": result_json,
+                                })
+                                continue
                             result_json, raw_results, geo = await self._handle_job_search(block.input)
                             search_performed = True
                             listings_results = raw_results
@@ -782,7 +808,10 @@ class ConversationEngine:
 
         Returns (json_str, raw_results, geo_dict).
         """
-        location = tool_input["location"]
+        location = (tool_input.get("location") or "").strip()
+        if not location:
+            # Should be caught by the dispatch guard, but never crash here.
+            return json.dumps({"results": [], "result_count": 0, "error": "no_location"}), [], None
         geo = await geocode_location(location)
 
         latitude = geo["latitude"] if geo else None
@@ -833,7 +862,9 @@ class ConversationEngine:
 
         Returns (json_str, raw_results, geo_dict).
         """
-        location = tool_input["location"]
+        location = (tool_input.get("location") or "").strip()
+        if not location:
+            return json.dumps({"results": [], "result_count": 0, "error": "no_location"}), [], None
         geo = await geocode_location(location)
 
         latitude = geo["latitude"] if geo else None
