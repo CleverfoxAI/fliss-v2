@@ -569,13 +569,22 @@ class ConversationEngine:
 
         # Tool-calling loop
         while True:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=turn_system,
-                tools=turn_tools,
-                messages=messages,
-            )
+            try:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=turn_system,
+                    tools=turn_tools,
+                    messages=messages,
+                )
+            except Exception as exc:
+                # Tagged + searchable so the cause is findable in Railway logs
+                # without hunting a full traceback (grep "FLISS-ERROR").
+                logging.exception(
+                    "FLISS-ERROR step=anthropic model=%s err=%s",
+                    self.model, type(exc).__name__,
+                )
+                raise
 
             assistant_content = response.content
             messages.append({"role": "assistant", "content": assistant_content})

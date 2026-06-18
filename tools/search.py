@@ -1,9 +1,21 @@
 from __future__ import annotations
+import asyncio
+import logging
 import asyncpg
 from config import get_settings
 
 
 _pool: asyncpg.Pool | None = None
+
+# Transient DB errors worth retrying (stale pooled connection, server blip,
+# network reset, timeout). Built defensively so a missing asyncpg attribute
+# can't crash import.
+_DB_RETRY_ERRORS = tuple(
+    e for e in (
+        getattr(asyncpg, "PostgresConnectionError", None),
+        getattr(asyncpg, "InterfaceError", None),
+    ) if e is not None
+) + (ConnectionError, OSError, asyncio.TimeoutError)
 
 RATING_TEXT_TO_NUMBER = {
     "outstanding": 5,
@@ -37,7 +49,14 @@ async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         settings = get_settings()
-        _pool = await asyncpg.create_pool(settings.database_url)
+        _pool = await asyncpg.create_pool(
+            settings.database_url,
+            # Recycle idle connections so the pool never hands out a stale one
+            # the DB has already closed — a common cause of intermittent
+            # "trouble reaching live results".
+            max_inactive_connection_lifetime=120,
+            command_timeout=30,
+        )
     return _pool
 
 
@@ -46,6 +65,29 @@ async def close_pool():
     if _pool:
         await _pool.close()
         _pool = None
+
+
+async def _run_query(query: str, params: list, attempts: int = 3) -> list:
+    """Run a fetch with retry on transient connection errors.
+
+    asyncpg discards a broken connection when it errors, so simply retrying the
+    acquire+fetch lets the pool hand us a healthy one — without tearing down the
+    shared pool (which would disrupt concurrent requests).
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                return await conn.fetch(query, *params)
+        except _DB_RETRY_ERRORS as exc:
+            last_exc = exc
+            logging.warning(
+                "FLISS-ERROR step=db_query attempt=%d/%d err=%s: %s",
+                i + 1, attempts, type(exc).__name__, exc,
+            )
+            await asyncio.sleep(0.3 * (2 ** i))
+    raise last_exc
 
 
 async def search_listings(
@@ -70,7 +112,6 @@ async def search_listings(
     if not settings.use_live_db:
         return _filter_test_data(page_type, keywords, limit)
 
-    pool = await get_pool()
     db_type = TYPE_MAP.get(page_type, page_type)
     kw_list = keywords or []
 
@@ -168,23 +209,22 @@ async def search_listings(
     """
     params.append(limit)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-        results = []
-        for row in rows:
-            r = dict(row)
-            # Convert Decimal latitude/longitude to float for JSON serialization
-            if r.get("latitude") is not None:
-                r["latitude"] = float(r["latitude"])
-            if r.get("longitude") is not None:
-                r["longitude"] = float(r["longitude"])
-            if r.get("distance_km") is not None:
-                r["distance_km"] = float(r["distance_km"])
-            r.setdefault("slug", None)
-            r.setdefault("overallRating", None)
-            r["totalRate"] = _rating_to_number(r.get("overallRating"))
-            results.append(r)
-        return results
+    rows = await _run_query(query, params)
+    results = []
+    for row in rows:
+        r = dict(row)
+        # Convert Decimal latitude/longitude to float for JSON serialization
+        if r.get("latitude") is not None:
+            r["latitude"] = float(r["latitude"])
+        if r.get("longitude") is not None:
+            r["longitude"] = float(r["longitude"])
+        if r.get("distance_km") is not None:
+            r["distance_km"] = float(r["distance_km"])
+        r.setdefault("slug", None)
+        r.setdefault("overallRating", None)
+        r["totalRate"] = _rating_to_number(r.get("overallRating"))
+        results.append(r)
+    return results
 
 
 # ── Jobs search ──────────────────────────────────────────────────────────────
@@ -212,8 +252,6 @@ async def search_jobs(
     settings = get_settings()
     if not settings.use_live_db:
         return _filter_test_jobs(keywords, limit)
-
-    pool = await get_pool()
 
     conditions = [
         "j.status = 'ACTIVE'",
@@ -312,19 +350,18 @@ async def search_jobs(
     """
     params.append(limit)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-        results = []
-        for row in rows:
-            r = dict(row)
-            if r.get("latitude") is not None:
-                r["latitude"] = float(r["latitude"])
-            if r.get("longitude") is not None:
-                r["longitude"] = float(r["longitude"])
-            if r.get("distance_km") is not None:
-                r["distance_km"] = float(r["distance_km"])
-            results.append(r)
-        return results
+    rows = await _run_query(query, params)
+    results = []
+    for row in rows:
+        r = dict(row)
+        if r.get("latitude") is not None:
+            r["latitude"] = float(r["latitude"])
+        if r.get("longitude") is not None:
+            r["longitude"] = float(r["longitude"])
+        if r.get("distance_km") is not None:
+            r["distance_km"] = float(r["distance_km"])
+        results.append(r)
+    return results
 
 
 # ── Test data fallback (no DB) ───────────────────────────────────────────────
