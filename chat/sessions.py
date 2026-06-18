@@ -27,6 +27,8 @@ _DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 class InMemorySessionStore:
     """Bounded in-process store. Lost on restart; LRU-evicts the oldest when full."""
 
+    label = "memory"
+
     def __init__(self, max_sessions: int = _DEFAULT_MAX_SESSIONS):
         self._data: "OrderedDict[str, list]" = OrderedDict()
         self._max = max_sessions
@@ -54,6 +56,8 @@ class RedisSessionStore:
     ``FLISS-ERROR step=session_*`` line — the chat endpoint never fails because of
     the session store.
     """
+
+    label = "redis"
 
     def __init__(self, url: str, ttl_seconds: int = _DEFAULT_TTL_SECONDS):
         import redis.asyncio as redis  # imported only when Redis is configured

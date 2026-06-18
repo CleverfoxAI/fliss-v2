@@ -272,7 +272,9 @@ async def history(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    # session_store reports the active backend ("redis" once REDIS_URL is set,
+    # else "memory") so persistence activation can be verified without log access.
+    return {"status": "ok", "session_store": getattr(_session_store, "label", "memory")}
 
 
 # ── Test chat UI ─────────────────────────────────────────────────────────────
