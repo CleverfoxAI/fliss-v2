@@ -398,7 +398,16 @@ class ConversationEngine:
             frontend_type: 'CAREHOME', 'NURSERY', or 'HOMECARE' (from frontend).
         """
         settings = get_settings()
-        self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # max_retries: SDK auto-retries transient failures (429 rate-limit,
+        # 529 overloaded, 5xx, connection errors) with exponential backoff —
+        # the most common cause of intermittent "trouble reaching live results".
+        # timeout: cap a single attempt so a hung connection fails fast and retries
+        # rather than stalling the whole turn.
+        self.client = AsyncAnthropic(
+            api_key=settings.anthropic_api_key,
+            max_retries=4,
+            timeout=60.0,
+        )
         # Resolve the configured model through the central remap (config.resolve_model)
         # so a stale/retired FLISS_MODEL value can't take the service down. Keeping
         # this in one place means the engine and the startup validity check (main.py)
