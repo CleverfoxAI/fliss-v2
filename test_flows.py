@@ -92,6 +92,52 @@ def test_carehome_flow_still_defers_to_wellbeing_checkin():
     assert res["answer"] == WELLBEING_CHECKIN_QUESTION, "CAREHOME should defer to the wellbeing check-in"
 
 
+def test_radius_expands_only_when_no_results():
+    """Empty nearby search widens the radius; a search with hits is untouched."""
+    import chat.engine as engine
+
+    eng = engine.ConversationEngine("JOBS")
+
+    # search_jobs returns [] until the radius crosses 25 (simulating a county
+    # whose roles sit outside the default 25 km).
+    calls = []
+
+    async def fake_search_jobs(*, latitude, longitude, radius_km, keywords, job_type, limit):
+        calls.append(radius_km)
+        return [{"title": "Care Assistant"}] if radius_km > 25 else []
+
+    async def fake_geocode(_loc):
+        return {"latitude": 51.8, "longitude": -0.2, "formatted_address": "Hertfordshire, UK"}
+
+    orig_search, orig_geo = engine.search_jobs, engine.geocode_location
+    engine.search_jobs = fake_search_jobs
+    engine.geocode_location = fake_geocode
+    try:
+        _j, rows, _g = asyncio.run(eng._handle_job_search({"location": "Hertfordshire"}))
+    finally:
+        engine.search_jobs, engine.geocode_location = orig_search, orig_geo
+
+    assert rows == [{"title": "Care Assistant"}], "expansion should surface the county's roles"
+    assert max(calls) > 25, f"radius should have widened beyond 25; tried {calls}"
+
+    # Control: when the first (25 km) search already returns a hit, no widening.
+    calls.clear()
+
+    async def fake_hit(*, latitude, longitude, radius_km, keywords, job_type, limit):
+        calls.append(radius_km)
+        return [{"title": "Nurse"}]
+
+    engine.search_jobs = fake_hit
+    engine.geocode_location = fake_geocode
+    try:
+        _j, rows, _g = asyncio.run(eng._handle_job_search({"location": "Watford"}))
+    finally:
+        engine.search_jobs, engine.geocode_location = orig_search, orig_geo
+
+    assert rows == [{"title": "Nurse"}]
+    assert calls == [25], f"no widening when results exist; tried {calls}"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

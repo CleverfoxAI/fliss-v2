@@ -896,12 +896,33 @@ class ConversationEngine:
                 limit=limit,
             )
 
+        # Final fallback: still nothing nearby — widen the radius so a county-level
+        # ("Hertfordshire") or sparse-area search surfaces the closest options
+        # instead of an empty screen. Additive-on-empty and only with coordinates,
+        # so it can never change or slow a search that already found something.
+        used_radius = radius
+        if not results and geo:
+            keyword_match = False
+            for wider in (radius * 3, radius * 6):
+                results = await search_listings(
+                    page_type=self.frontend_type,
+                    latitude=latitude,
+                    longitude=longitude,
+                    radius_km=wider,
+                    keywords=None,
+                    limit=limit,
+                )
+                used_radius = wider
+                if results:
+                    break
+
         # Build response JSON with metadata about the search
         response_data = {
             "results": results,
             "keyword_match": keyword_match,
             "keywords_requested": keywords or [],
             "location": location,
+            "radius_km": used_radius,
             "result_count": len(results),
         }
 
@@ -949,11 +970,31 @@ class ConversationEngine:
                 limit=limit,
             )
 
+        # Final fallback: widen the radius for county-level / sparse-area searches
+        # (this is what Nathan hit with "Hertfordshire"). Additive-on-empty and
+        # only with coordinates — never changes a search that already found jobs.
+        used_radius = radius
+        if not results and geo:
+            keyword_match = False
+            for wider in (radius * 3, radius * 6):
+                results = await search_jobs(
+                    latitude=latitude,
+                    longitude=longitude,
+                    radius_km=wider,
+                    keywords=None,
+                    job_type=job_type,
+                    limit=limit,
+                )
+                used_radius = wider
+                if results:
+                    break
+
         response_data = {
             "results": results,
             "keyword_match": keyword_match,
             "keywords_requested": keywords or [],
             "location": location,
+            "radius_km": used_radius,
             "result_count": len(results),
         }
 
