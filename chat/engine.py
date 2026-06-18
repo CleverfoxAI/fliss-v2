@@ -329,8 +329,8 @@ def _assistant_text(msg: dict) -> str:
         return content
     if isinstance(content, list):
         return " ".join(
-            getattr(block, "text", "") if hasattr(block, "text")
-            else block.get("text", "") if isinstance(block, dict)
+            (getattr(block, "text", "") or "") if hasattr(block, "text")
+            else (block.get("text", "") or "") if isinstance(block, dict)
             else ""
             for block in content
         )
@@ -453,6 +453,11 @@ class ConversationEngine:
                 "center_lng": float | None,
             }
         """
+        # Jobs is a job-seeker flow, not a care-seeker flow: skip the wellbeing
+        # check-in, distress support, and funding detours — those are for families
+        # looking for care and were wrongly firing on the Jobs page.
+        is_jobs = self.frontend_type == "JOBS"
+
         # --- Wellbeing support short-circuit (robust) ---
         # Trigger off the visible transcript, not pending_results metadata,
         # which does not survive all session storage paths. If the previous
@@ -486,7 +491,7 @@ class ConversationEngine:
         # about to freelance an empathic reply with markdown links that the
         # frontend truncates. Pre-empt it with the hardcoded support message
         # + acknowledgment. The LLM never sees this turn.
-        if _detected_negative and not _checkin_done:
+        if _detected_negative and not _checkin_done and not is_jobs:
             pending = _get_pending_results(conversation_history) or {}
             answer = _wellbeing_support_message(self.frontend_type) + WELLBEING_ACKNOWLEDGMENT
             print(f"[WB-DIAG] distress_short_circuit=TAKEN answer_first200={answer[:200]!r}", flush=True)
@@ -501,7 +506,7 @@ class ConversationEngine:
                 "filters_used": pending.get("filters_used"),
             }
 
-        if _last_assistant_asked_wellbeing(conversation_history):
+        if _last_assistant_asked_wellbeing(conversation_history) and not is_jobs:
             if _wellbeing_response_is_negative(message):
                 answer = _wellbeing_support_message(self.frontend_type) + WELLBEING_ACKNOWLEDGMENT
             else:
@@ -557,7 +562,7 @@ class ConversationEngine:
         # cannot search. Any response that isn't an explicit "no/skip" is
         # treated as wanting funding info. This is intentionally aggressive
         # because the AI was ignoring prompt-level instructions ~50% of the time.
-        awaiting_funding = _last_assistant_offered_funding(messages)
+        awaiting_funding = (not is_jobs) and _last_assistant_offered_funding(messages)
         if awaiting_funding and not _user_declined_funding(message):
             # Strip search tools — only keep knowledge base tool
             turn_tools = [t for t in self.tools if t["name"] == "search_knowledge_base"]
@@ -752,6 +757,7 @@ class ConversationEngine:
                 # as pending_results, and let the next turn return them.
                 if (
                     search_performed
+                    and not is_jobs
                     and not _wellbeing_checkin_done(messages[:-1])
                     and not _wellbeing_checkin_offered(messages[:-1])
                 ):
