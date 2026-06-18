@@ -19,6 +19,26 @@ FRONTEND_TYPE_TO_PAGE = {
 }
 
 
+# Shared Anthropic client. The SDK is designed to be instantiated once and reused
+# across concurrent requests — creating one per request leaks httpx connections
+# and sockets over time. Lazily created so import never needs the API key.
+_client: AsyncAnthropic | None = None
+
+
+def _get_client() -> AsyncAnthropic:
+    global _client
+    if _client is None:
+        _client = AsyncAnthropic(
+            api_key=get_settings().anthropic_api_key,
+            # Auto-retry transient failures (429 rate-limit, 529 overloaded, 5xx,
+            # connection errors) with exponential backoff; cap a single attempt so
+            # a hung connection fails fast and retries rather than stalling.
+            max_retries=4,
+            timeout=60.0,
+        )
+    return _client
+
+
 TOOLS_LISTINGS = [
     {
         "name": "search_listings",
@@ -398,16 +418,9 @@ class ConversationEngine:
             frontend_type: 'CAREHOME', 'NURSERY', or 'HOMECARE' (from frontend).
         """
         settings = get_settings()
-        # max_retries: SDK auto-retries transient failures (429 rate-limit,
-        # 529 overloaded, 5xx, connection errors) with exponential backoff —
-        # the most common cause of intermittent "trouble reaching live results".
-        # timeout: cap a single attempt so a hung connection fails fast and retries
-        # rather than stalling the whole turn.
-        self.client = AsyncAnthropic(
-            api_key=settings.anthropic_api_key,
-            max_retries=4,
-            timeout=60.0,
-        )
+        # Reuse the shared Anthropic client (see _get_client) instead of creating
+        # one per request — avoids leaking httpx connections under load.
+        self.client = _get_client()
         # Resolve the configured model through the central remap (config.resolve_model)
         # so a stale/retired FLISS_MODEL value can't take the service down. Keeping
         # this in one place means the engine and the startup validity check (main.py)
