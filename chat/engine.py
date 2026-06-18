@@ -566,6 +566,7 @@ class ConversationEngine:
         listings_results = []
         center_lat = None
         center_lng = None
+        tool_rounds = 0  # safety cap so a pathological tool loop can't hang the request
 
         # Tool-calling loop
         while True:
@@ -589,7 +590,8 @@ class ConversationEngine:
             assistant_content = response.content
             messages.append({"role": "assistant", "content": assistant_content})
 
-            if response.stop_reason == "tool_use":
+            if response.stop_reason == "tool_use" and tool_rounds < 8:
+                tool_rounds += 1
                 tool_results = []
                 for block in assistant_content:
                     if block.type == "tool_use":
@@ -657,7 +659,7 @@ class ConversationEngine:
                                 center_lng = geo["longitude"]
                         elif block.name == "search_knowledge_base":
                             results = await search_knowledge_base(
-                                query=block.input["query"],
+                                query=block.input.get("query", ""),
                                 page_type=self.page_type,
                             )
                             result_json = json.dumps(results, default=str)
@@ -769,6 +771,17 @@ class ConversationEngine:
                         "answer_first120=%r",
                         self.model, self.frontend_type, search_performed, answer[:120],
                     )
+
+                # Safety net: never return an empty message to the user (can happen
+                # if the model stops on tool_use at the loop cap, or replies with no
+                # text). Give a gentle clarify prompt instead of a blank bubble.
+                if not (answer or "").strip():
+                    answer = (
+                        "Sorry, I didn't quite catch that. Could you tell me a bit "
+                        "more about the care you're looking for and the town or postcode?"
+                    )
+                    if intent == "listings":
+                        intent, confidence = "clarify", 0.8
 
                 print(f"[WB-DIAG] final_return answer_first200={answer[:200]!r} intent={intent}", flush=True)
                 return {

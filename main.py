@@ -82,8 +82,11 @@ class QueryResponse(BaseModel):
     center_lng: Optional[float] = None
 
 
-# In-memory conversation history per session
+# In-memory conversation history per session.
+# Bounded so it can't grow without limit and slowly OOM the service: when the
+# cap is reached, the oldest-created session is evicted (insertion order).
 _sessions: dict = {}
+_MAX_SESSIONS = 2000
 
 VALID_PAGE_TYPES = {"CAREHOME", "NURSERY", "HOMECARE", "JOBS"}
 
@@ -195,6 +198,9 @@ async def query(req: QueryRequest):
         # Get or create conversation history for this session
         session_key = f"{session_id}:{page_type}"
         if session_key not in _sessions:
+            if len(_sessions) >= _MAX_SESSIONS:
+                # Evict the oldest-created session to bound memory.
+                _sessions.pop(next(iter(_sessions)), None)
             _sessions[session_key] = []
         history = _sessions[session_key]
 
