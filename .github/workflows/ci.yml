@@ -19,3 +19,5 @@ jobs:
         run: python -m py_compile config.py main.py chat/engine.py
       - name: Model-resolution regression tests
         run: python test_model_resolution.py
+      - name: Resilience regression tests
+        run: python test_resilience.py
