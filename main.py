@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from chat.engine import ConversationEngine
 from chat.persistence import save_conversation
+from chat.sessions import build_session_store
 from tools.search import close_pool
 
 
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
     _check_model_config()
     yield
     await close_pool()
+    await _session_store.close()
 
 
 app = FastAPI(
@@ -82,11 +84,10 @@ class QueryResponse(BaseModel):
     center_lng: Optional[float] = None
 
 
-# In-memory conversation history per session.
-# Bounded so it can't grow without limit and slowly OOM the service: when the
-# cap is reached, the oldest-created session is evicted (insertion order).
-_sessions: dict = {}
-_MAX_SESSIONS = 2000
+# Conversation history per session. Defaults to a bounded in-memory store;
+# set REDIS_URL to persist conversations across deploys/restarts and replicas
+# (see chat/sessions.py). Selection never raises and falls back to in-memory.
+_session_store = build_session_store()
 
 VALID_PAGE_TYPES = {"CAREHOME", "NURSERY", "HOMECARE", "JOBS"}
 
@@ -197,12 +198,7 @@ async def query(req: QueryRequest):
     try:
         # Get or create conversation history for this session
         session_key = f"{session_id}:{page_type}"
-        if session_key not in _sessions:
-            if len(_sessions) >= _MAX_SESSIONS:
-                # Evict the oldest-created session to bound memory.
-                _sessions.pop(next(iter(_sessions)), None)
-            _sessions[session_key] = []
-        history = _sessions[session_key]
+        history = await _session_store.get(session_key) or []
 
         engine = ConversationEngine(frontend_type=page_type)
         result = await engine.chat(
@@ -229,6 +225,7 @@ async def query(req: QueryRequest):
         if result.get("pending_results"):
             assistant_msg["pending_results"] = result["pending_results"]
         history.append(assistant_msg)
+        await _session_store.set(session_key, history)
 
         # Fire-and-forget persistence of the full conversation for analysis.
         location = None
@@ -267,7 +264,7 @@ async def history(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     session_key = f"{session_id}:{page_type}"
-    messages = _sessions.get(session_key, [])
+    messages = await _session_store.get(session_key) or []
     return {"session_id": session_id, "page_type": page_type, "messages": messages[-limit:]}
 
 
