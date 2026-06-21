@@ -7,7 +7,7 @@ from config import get_settings, resolve_model
 from chat.prompts import get_system_prompt
 from tools.search import search_listings, search_jobs
 from tools.knowledge import search_knowledge_base
-from tools.geocoding import geocode_location
+from tools.geocoding import geocode_location, UK_LOCATIONS
 
 
 # Map frontend type values to our internal page_type for prompts
@@ -246,6 +246,78 @@ def _conversation_mentions_who(messages: list[dict], frontend_type: str | None =
             if indicator in text:
                 return True
     return False
+
+
+# ── Known-facts state injection ───────────────────────────────────────────────
+# Deterministically extract what the user has already told us (location, who the
+# care is for, conditions) and re-state it to the model every turn, so it can
+# never re-ask for information already given ("you already said Brighton").
+
+# Relationship nouns whose presence names *who* the care is for (value words,
+# not the possessive "my "/"our " patterns used elsewhere).
+_WHO_VALUE_TERMS = [
+    "mum", "mom", "mother", "dad", "father", "parents", "parent",
+    "nan", "nana", "nanny", "grandmother", "grandma", "grandad",
+    "grandfather", "grandpa", "gran",
+    "son", "daughter", "child", "children", "wife", "husband", "partner",
+    "brother", "sister", "uncle", "aunt", "auntie", "friend", "neighbour",
+    "neighbor", "myself",
+]
+_WHO_VALUE_RE = re.compile(r"\b(" + "|".join(_WHO_VALUE_TERMS) + r")\b", re.I)
+
+# Town/area names are matched on word boundaries. A few keys double as common
+# English words ("reading", "bath") — exclude them from free-text matching to
+# avoid false positives (they're still trusted when they come from a real search).
+_AMBIGUOUS_PLACE_KEYS = {"reading", "bath"}
+_PLACE_KEYS = sorted(
+    (re.escape(k) for k in UK_LOCATIONS if k not in _AMBIGUOUS_PLACE_KEYS),
+    key=len, reverse=True,
+)
+_PLACE_RE = re.compile(r"\b(" + "|".join(_PLACE_KEYS) + r")\b", re.I)
+
+
+def _known_facts_block(conversation_history: list[dict], current_message: str,
+                       frontend_type: str | None) -> str:
+    """Build a system-prompt note listing facts already established, or ''."""
+    prior_location = None
+    prior_keywords = None
+    for m in reversed(conversation_history):
+        if m.get("role") == "assistant":
+            f = m.get("filters_used")
+            if f:
+                prior_location = prior_location or f.get("location")
+                prior_keywords = prior_keywords or f.get("keywords")
+
+    user_blob = " ".join(
+        m["content"] for m in conversation_history
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    )
+    user_blob = f"{user_blob} {current_message or ''}"
+
+    facts = []
+
+    location = prior_location
+    if not location:
+        match = _PLACE_RE.search(user_blob)
+        if match:
+            location = match.group(1).title()
+    if location:
+        facts.append(f"location: {location}")
+
+    if (frontend_type or "").upper() != "JOBS":
+        who = _WHO_VALUE_RE.search(user_blob)
+        if who:
+            facts.append(f"who the care is for: their {who.group(1).lower()}")
+
+    if prior_keywords:
+        facts.append("needs/conditions already mentioned: " + ", ".join(prior_keywords))
+
+    if not facts:
+        return ""
+    return (
+        "\n\n[ALREADY ESTABLISHED earlier in THIS conversation — do NOT ask the "
+        "user for any of these again; use them directly: " + "; ".join(facts) + ".]"
+    )
 
 
 WELLBEING_CHECKIN_QUESTION = (
@@ -578,6 +650,12 @@ class ConversationEngine:
         else:
             turn_tools = self.tools
             turn_system = self.system_prompt
+
+        # Re-state facts already given so the model can't re-ask for them
+        # (the "you already said Brighton" / "you already told me dementia" bug).
+        turn_system = turn_system + _known_facts_block(
+            conversation_history, message, self.frontend_type
+        )
 
         search_performed = False
         filters_used = None

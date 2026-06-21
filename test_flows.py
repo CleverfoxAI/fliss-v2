@@ -138,6 +138,49 @@ def test_radius_expands_only_when_no_results():
     assert calls == [25], f"no widening when results exist; tried {calls}"
 
 
+def test_known_facts_extracts_location_who_and_conditions():
+    from chat.engine import _known_facts_block
+
+    hist = [
+        {"role": "user", "content": "care home for my mum with dementia"},
+        {"role": "assistant", "content": "Tell me more...",
+         "filters_used": {"location": "Brighton", "keywords": ["dementia"]}},
+    ]
+    block = _known_facts_block(hist, "yes show me", "CAREHOME")
+    assert "location: Brighton" in block
+    assert "their mum" in block
+    assert "dementia" in block
+
+    # Pre-search: location pulled from free text (no filters_used yet).
+    block2 = _known_facts_block(
+        [{"role": "user", "content": "I've already said brighton"}],
+        "yes", "CAREHOME",
+    )
+    assert "location: Brighton" in block2
+
+
+def test_known_facts_no_false_positives():
+    from chat.engine import _known_facts_block
+
+    # 'person' contains 'son', 'bathroom' contains 'bath', 'reading' is ambiguous —
+    # none should be extracted as facts.
+    for text in ("I'm cleaning the bathroom", "every person matters",
+                 "I was reading a book", "no idea really"):
+        block = _known_facts_block([], text, "CAREHOME")
+        assert block == "", f"unexpected facts from {text!r}: {block!r}"
+
+
+def test_known_facts_skips_who_for_jobs():
+    from chat.engine import _known_facts_block
+
+    block = _known_facts_block(
+        [{"role": "user", "content": "care assistant jobs, I'm a mum returning to work"}],
+        "in Brighton", "JOBS",
+    )
+    assert "who the care is for" not in block  # jobs has no care-recipient
+    assert "location: Brighton" in block
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":
